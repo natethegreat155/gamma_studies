@@ -10,6 +10,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import os
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -17,6 +18,9 @@ import numpy as np
 import pytz
 import streamlit as st
 import plotly.graph_objects as go
+
+# Symbols to fetch for multi-tab view (API symbol, display label)
+MULTI_SYMBOLS = [("$SPX", "SPX"), ("SPY", "SPY"), ("QQQ", "QQQ")]
 
 from main import (
     _load_broker_client,
@@ -47,57 +51,69 @@ def generate_gex_interpretation(
     spot_price: float,
     total_gex: float,
     king_strike: Optional[float],
-    top_positive: List[float],
-    top_negative: List[float],
+    downside_defense: List[float],
+    upside_resistance: List[float],
     per_strike_gex: Dict[float, float],
 ) -> str:
-    """Generate a 3-4 sentence interpretation of the GEX dashboard."""
+    """Generate a dynamically tailored interpretation of the GEX dashboard."""
     sentences = []
 
-    # Sentence 1: Overall context
+    # Sentence 1: Overall context with magnitude nuance
     net = "positive" if total_gex > 0 else "negative"
+    abs_total = abs(total_gex)
+    mag = "elevated" if abs_total > 20 else "moderate" if abs_total > 5 else "modest"
     sentences.append(
-        f"With spot at ${spot_price:.0f}, total gamma exposure stands at ${total_gex:.2f}B ({net}), "
-        f"indicating dealers are {'long gamma overall and may dampen volatility' if total_gex > 0 else 'short gamma and may amplify directional moves'}."
+        f"Spot at ${spot_price:.0f} with {net} total GEX of ${abs_total:.2f}B ({mag} dealer gamma); "
+        f"dealers are {'long gamma—expect mean reversion and dampened moves' if total_gex > 0 else 'short gamma—momentum can extend as hedging amplifies direction'}."
     )
 
-    # Sentence 2: King Node
+    # Sentence 2: King Node with relative dominance
     if king_strike is not None:
         king_gex = per_strike_gex.get(king_strike, 0)
         king_role = "support" if king_gex > 0 else "resistance"
-        above_below = "above" if spot_price > king_strike else "below"
+        dist = spot_price - king_strike
+        second = sorted(
+            [(s, abs(per_strike_gex[s])) for s in per_strike_gex if s != king_strike],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        ratio = ""
+        if second:
+            r = abs(king_gex) / second[0][1] if second[0][1] else 0
+            if r > 2:
+                ratio = f"—{r:.1f}x the next level—"
         sentences.append(
-            f"The King Node at ${king_strike:.0f} (${abs(king_gex):.2f}B {'positive' if king_gex > 0 else 'negative'}) "
-            f"acts as strong {king_role}; with spot {above_below} this level, expect price to be "
-            f"{'attracted toward' if king_gex > 0 else 'repelled from'} ${king_strike:.0f} as dealers hedge."
+            f"The King Node at ${king_strike:.0f} (${abs(king_gex):.2f}B {king_role}) {ratio} "
+            f"dominates; spot is {abs(dist):.0f} pts {'above' if dist > 0 else 'below'}, so expect "
+            f"{'support and bounce risk' if king_gex > 0 else 'resistance and rejection risk'} on approach."
         )
     else:
-        sentences.append("No dominant King Node is present in the current strike range.")
+        sentences.append("No dominant King Node in the viewed range; gamma is distributed across multiple strikes.")
 
-    # Sentence 3: Gatekeepers
-    supp = [s for s in top_positive if s != king_strike][:2]
-    res = [s for s in top_negative if s != king_strike][:2]
-    gatekeeper_parts = []
-    if supp:
-        supp_str = ", ".join(f"${s:.0f}" for s in supp)
-        gatekeeper_parts.append(f"support gatekeepers at {supp_str}")
-    if res:
-        res_str = ", ".join(f"${s:.0f}" for s in res)
-        gatekeeper_parts.append(f"resistance gatekeepers at {res_str}")
-    if gatekeeper_parts:
+    # Sentence 3: Downside defense and upside resistance (actual roles, not generic gatekeepers)
+    parts = []
+    if downside_defense:
+        dd_str = ", ".join(f"${s:.0f} (${per_strike_gex[s]:.2f}B)" for s in downside_defense[:2])
+        parts.append(f"Downside defense at {dd_str}")
+    if upside_resistance:
+        ur_str = ", ".join(f"${s:.0f} (${abs(per_strike_gex[s]):.2f}B)" for s in upside_resistance[:2])
+        parts.append(f"Upside resistance at {ur_str}")
+    if parts:
         sentences.append(
-            "Key " + " and ".join(gatekeeper_parts) + " "
-            "add additional layers of dealer hedging that can slow or reverse moves as price approaches these strikes."
+            "Focal levels: " + " and ".join(parts) + ". "
+            "These act as magnets or walls depending on dealer delta hedging as price approaches."
         )
 
-    # Sentence 4: Near-term implication
-    references = [s for s in ([king_strike] if king_strike else []) + supp + res if s]
-    if references:
-        nearest = min(references, key=lambda s: abs(s - spot_price))
+    # Sentence 4: Nearest level and break implication (use actual distances)
+    refs = [s for s in ([king_strike] if king_strike else []) + downside_defense + upside_resistance if s]
+    if refs:
+        nearest = min(refs, key=lambda s: abs(s - spot_price))
+        pts = abs(spot_price - nearest)
         direction = "up" if spot_price < nearest else "down"
+        g = per_strike_gex.get(nearest, 0)
         sentences.append(
-            f"The nearest major gamma level to spot is ${nearest:.0f}; "
-            f"a break {'above' if direction == 'up' else 'below'} could accelerate moves as dealer hedging flips."
+            f"Nearest key level: ${nearest:.0f} ({pts:.0f} pts {direction}); "
+            f"a break {'above' if direction == 'up' else 'below'} flips dealer hedging and may accelerate."
         )
 
     return " ".join(sentences)
@@ -107,57 +123,75 @@ def generate_trader_suggestions(
     spot_price: float,
     total_gex: float,
     king_strike: Optional[float],
-    top_positive: List[float],
-    top_negative: List[float],
+    downside_defense: List[float],
+    upside_resistance: List[float],
     per_strike_gex: Dict[float, float],
 ) -> str:
-    """Generate 3-4 sentence trading suggestions based on GEX profile."""
+    """Generate data-driven trading suggestions from the GEX profile."""
     sentences = []
 
-    supp = [s for s in top_positive if s != king_strike][:2]
-    res = [s for s in top_negative if s != king_strike][:2]
-    key_levels = [s for s in ([king_strike] if king_strike else []) + supp + res if s]
+    refs = [s for s in ([king_strike] if king_strike else []) + downside_defense + upside_resistance if s]
+    near_pct = 0.015  # within 1.5% of spot = "near"
+    near_threshold = spot_price * near_pct
 
-    # Suggestion 1: Key levels to watch
-    if key_levels:
-        levels_str = ", ".join(f"${s:.0f}" for s in sorted(key_levels, reverse=True))
+    # Suggestion 1: Concrete levels with GEX values
+    if refs:
+        levels = sorted(set(refs), reverse=True)
+        levels_str = ", ".join(f"${s:.0f}" for s in levels[:5])
         sentences.append(
-            f"Traders should watch {levels_str} as primary decision points; "
-            f"expect potential reversals or pauses at positive-gamma strikes and breakout acceleration through negative-gamma resistance."
+            f"Watch {levels_str} as decision points: "
+            f"{'fade extensions toward positive-GEX strikes, trail stops through negative-GEX resistance' if total_gex != 0 else 'expect chop until a gamma level breaks'}."
         )
     else:
-        sentences.append("Monitor the nearest high-OI strikes for potential support and resistance.")
+        sentences.append("Focus on the highest-OI strikes in the chain for likely support and resistance.")
 
-    # Suggestion 2: Fade vs follow based on total GEX
+    # Suggestion 2: Fade vs follow—tailored to magnitude
     if total_gex > 0:
         sentences.append(
-            "With positive total GEX, consider fading extended moves—mean reversion toward the King Node may offer better risk/reward than chasing breakouts."
+            f"Positive GEX (${total_gex:.2f}B) favors fading extended wicks; "
+            "consider selling premium or mean-reversion entries near gatekeeper support."
         )
-    else:
+    elif total_gex < 0:
         sentences.append(
-            "With negative total GEX, be cautious fading breakouts; momentum can extend as dealer hedging amplifies directional moves."
+            f"Negative GEX (${abs(total_gex):.2f}B) favors momentum—avoid fading breakouts; "
+            "wait for confirmation before adding, and use gamma levels as invalidation."
         )
 
-    # Suggestion 3: Near-spot trade idea
+    # Suggestion 3: Spot-specific idea (scale-aware "near")
     if king_strike is not None:
         dist = spot_price - king_strike
-        if abs(dist) < 50:
+        if abs(dist) <= near_threshold:
             sentences.append(
-                f"Spot is near the King Node at ${king_strike:.0f}; range-bound behavior is likely until a decisive break—tighten stops or reduce size until direction is clear."
+                f"Spot is within {abs(dist):.0f} pts of the King Node (${king_strike:.0f})—range likely; "
+                "reduce size or widen stops until a break confirms direction."
             )
-        elif dist > 0:
+        elif downside_defense and spot_price > max(downside_defense):
+            dd_near = min(downside_defense, key=lambda s: abs(s - spot_price))
+            pts = spot_price - dd_near
             sentences.append(
-                f"With spot above the King Node, a pullback toward ${king_strike:.0f} could present a long entry if it holds as support; invalidation below suggests follow-through lower."
+                f"Downside defense at ${dd_near:.0f} ({pts:.0f} pts below)— "
+                f"pullbacks may hold; break below ${dd_near:.0f} opens follow-through lower."
+            )
+        elif upside_resistance and spot_price < min(upside_resistance):
+            ur_near = min(upside_resistance, key=lambda s: abs(s - spot_price))
+            pts = ur_near - spot_price
+            sentences.append(
+                f"Upside resistance at ${ur_near:.0f} ({pts:.0f} pts above)— "
+                f"rallies may stall; break above ${ur_near:.0f} flips hedging and can extend."
             )
         else:
+            direction = "above" if dist > 0 else "below"
             sentences.append(
-                f"With spot below the King Node, a rally toward ${king_strike:.0f} may stall as resistance; a breakout above would signal dealer hedging has flipped and could extend higher."
+                f"King Node ${king_strike:.0f} is {abs(dist):.0f} pts {direction} spot; "
+                f"trade in that direction with a stop {'below' if dist > 0 else 'above'} the level."
             )
 
-    # Suggestion 4: General risk reminder
-    sentences.append(
-        "As always, use proper position sizing and respect key gamma levels as both profit targets and stop-loss references."
-    )
+    # Suggestion 4: Risk (short, data-aware)
+    nearest_break = min(refs, key=lambda s: abs(s - spot_price)) if refs else None
+    if nearest_break:
+        sentences.append(f"Use ${nearest_break:.0f} as a key level for stops and targets.")
+    else:
+        sentences.append("Size appropriately and use gamma clusters as stop references.")
 
     return " ".join(sentences)
 
@@ -175,9 +209,12 @@ def fetch_options_and_gex(
     now = datetime.now(eastern)
 
     if now.weekday() == 4 and now.hour >= 16:
-        use_date = (now + timedelta(days=3)).date()
+        from_date = (now + timedelta(days=3)).date()
     else:
-        use_date = now.date() + timedelta(days=1 if now.hour >= 16 else 0)
+        from_date = now.date() + timedelta(days=1 if now.hour >= 16 else 0)
+    # Equity options expire weekly (Fri) and monthly; indices like SPX can have daily exp.
+    # Widen range so we get the next expiration for equities when "today" has none.
+    to_date = from_date + timedelta(days=21)
 
     options_source = getattr(client, "get_option_chain", None)
     if not options_source:
@@ -196,8 +233,8 @@ def fetch_options_and_gex(
 
     kwargs = {
         "symbol": option_symbol,
-        "from_date": use_date,
-        "to_date": use_date,
+        "from_date": from_date,
+        "to_date": to_date,
         "strike_count": strike_count,
     }
     if contract_type_all is not None:
@@ -218,15 +255,318 @@ def fetch_options_and_gex(
         return None, f"API error {r.status_code}: {body}"
 
     data = r.json()
+
+    # Use only the nearest expiration (equities often have no exp on Wed; indices may have daily)
+    def _parse_exp_date(key: str) -> Optional[date]:
+        try:
+            part = (key.split(":")[0] if ":" in key else key)[:10]
+            if len(part) >= 10 and part[4] == "-" and part[7] == "-":
+                return datetime.strptime(part[:10], "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            pass
+        return None
+
+    today = now.date()
+    call_map = data.get("callExpDateMap", {})
+    put_map = data.get("putExpDateMap", {})
+    all_keys = list(call_map.keys()) + list(put_map.keys())
+    exp_dates = sorted({d for k in all_keys if (d := _parse_exp_date(k)) is not None and d >= today})
+    use_date = exp_dates[0] if exp_dates else from_date
+
+    # Filter to nearest expiration only (cleaner single-expiration GEX)
+    def _filter_to_exp(m: dict, exp: date) -> dict:
+        exp_str = exp.strftime("%Y-%m-%d")
+        return {k: v for k, v in m.items() if k.startswith(exp_str)}
+    data_filtered = dict(data)
+    data_filtered["callExpDateMap"] = _filter_to_exp(call_map, use_date) if exp_dates else call_map
+    data_filtered["putExpDateMap"] = _filter_to_exp(put_map, use_date) if exp_dates else put_map
+    if not data_filtered["callExpDateMap"] and not data_filtered["putExpDateMap"]:
+        data_filtered = data  # fallback: use all expirations if filter left nothing
+
     (
         total_gex,
         per_strike_gex,
         _change_in_gamma,
         _largest_changes,
         spot_price,
-    ) = calculate_gamma_exposure(data, previous_gamma or {})
-    details = get_per_strike_details(data)
-    return (data, total_gex, per_strike_gex, details, spot_price, use_date), None
+    ) = calculate_gamma_exposure(data_filtered, previous_gamma or {})
+    details = get_per_strike_details(data_filtered)
+    return (data_filtered, total_gex, per_strike_gex, details, spot_price, use_date), None
+
+
+@dataclass
+class SymbolGexData:
+    """Processed GEX data for one symbol."""
+    symbol: str
+    label: str
+    spot_price: float
+    total_gex: float
+    exp_date: date
+    per_strike_gex: Dict[float, float]
+    strike_details: Dict[float, Dict]
+    strikes: List[float]
+    king_strike: Optional[float]
+    king_gex: float
+    downside_defense: List[float]
+    upside_resistance: List[float]
+    gatekeeper_strikes: set
+    gamma_flip_strike: Optional[float]
+    dist_to_king: Optional[float]
+    nearest_gk_below: Optional[float]
+    nearest_gk_above: Optional[float]
+
+
+def _effective_strike_range(strike_range: int, spot_price: float) -> int:
+    """Scale strike window for lower-priced underlyings (SPY, QQQ)."""
+    if spot_price >= 1000:
+        return strike_range
+    return min(strike_range, max(50, int(spot_price * 0.2)))
+
+
+def process_symbol_gex(
+    result: Tuple,
+    strike_range: int,
+    gex_min_threshold: float,
+) -> Optional[SymbolGexData]:
+    """Process fetch result into SymbolGexData. Returns None if no usable strikes."""
+    _data, total_gex, per_strike_gex, strike_details, spot_price, exp_date = result
+    all_strikes = sorted(per_strike_gex.keys(), reverse=True)
+    if not all_strikes:
+        return None
+
+    eff_range = _effective_strike_range(strike_range, spot_price)
+    strikes_in_window = [s for s in all_strikes if abs(s - spot_price) <= eff_range]
+    if not strikes_in_window:
+        strikes_in_window = all_strikes
+    strikes = [s for s in strikes_in_window if abs(per_strike_gex[s]) >= gex_min_threshold]
+    if not strikes:
+        strikes = strikes_in_window
+
+    sorted_by_abs = sorted(
+        [(s, per_strike_gex[s]) for s in strikes],
+        key=lambda x: abs(x[1]),
+        reverse=True,
+    )
+    king_strike = sorted_by_abs[0][0] if sorted_by_abs else None
+    king_gex = per_strike_gex.get(king_strike, 0) if king_strike else 0
+
+    downside_defense = [
+        s for s, _ in sorted(
+            [(s, per_strike_gex[s]) for s in strikes if s < spot_price and per_strike_gex[s] > 0],
+            key=lambda x: x[1],
+            reverse=True,
+        )[:3]
+    ]
+    upside_resistance = [
+        s for s, _ in sorted(
+            [(s, per_strike_gex[s]) for s in strikes if s > spot_price and per_strike_gex[s] < 0],
+            key=lambda x: x[1],
+        )[:3]
+    ]
+    top_positive = [s for s, _ in sorted(per_strike_gex.items(), key=lambda x: x[1], reverse=True) if s in strikes][:3]
+    top_negative = [s for s, _ in sorted(per_strike_gex.items(), key=lambda x: x[1]) if s in strikes][:3]
+    gatekeeper_strikes = set(downside_defense + upside_resistance + top_positive + top_negative)
+
+    dist_to_king = abs(spot_price - king_strike) if king_strike else None
+    nearest_gk_below = min((s for s in gatekeeper_strikes if s < spot_price), key=lambda x: spot_price - x, default=None)
+    nearest_gk_above = min((s for s in gatekeeper_strikes if s > spot_price), key=lambda x: x - spot_price, default=None)
+
+    strikes_asc = sorted(strikes)
+    prev_cum, cum = 0, 0
+    gamma_flip_strike = None
+    for s in strikes_asc:
+        prev_cum = cum
+        cum += per_strike_gex[s]
+        if prev_cum != 0 and (prev_cum > 0) != (cum > 0):
+            gamma_flip_strike = s
+            break
+
+    return SymbolGexData(
+        symbol="",
+        label="",
+        spot_price=spot_price,
+        total_gex=total_gex,
+        exp_date=exp_date,
+        per_strike_gex=per_strike_gex,
+        strike_details=strike_details,
+        strikes=strikes,
+        king_strike=king_strike,
+        king_gex=king_gex,
+        downside_defense=downside_defense,
+        upside_resistance=upside_resistance,
+        gatekeeper_strikes=gatekeeper_strikes,
+        gamma_flip_strike=gamma_flip_strike,
+        dist_to_king=dist_to_king,
+        nearest_gk_below=nearest_gk_below,
+        nearest_gk_above=nearest_gk_above,
+    )
+
+
+def build_heatmap_fig(
+    data: SymbolGexData,
+    symbol_label: str,
+    exp_date_str: str,
+) -> go.Figure:
+    """Build a Plotly heatmap figure for given SymbolGexData."""
+    strikes = data.strikes
+    per_strike_gex = data.per_strike_gex
+    strike_details = data.strike_details
+    king_strike = data.king_strike
+    downside_defense = data.downside_defense
+    upside_resistance = data.upside_resistance
+    gatekeeper_strikes = data.gatekeeper_strikes
+    gamma_flip_strike = data.gamma_flip_strike
+    spot_price = data.spot_price
+
+    gex_values = [per_strike_gex[s] for s in strikes]
+    max_abs = max(abs(g) for g in gex_values) if gex_values else 1
+
+    z = np.array([[g] for g in gex_values])
+    gex_colorscale = [
+        [0.0, "#4B0082"], [0.25, "#8B0000"], [0.5, "#F5F5F5"],
+        [0.75, "#228B22"], [1.0, "#006400"],
+    ]
+    customdata = np.zeros((len(strikes), 1, 5))
+    cell_texts = []
+    for i, s in enumerate(strikes):
+        d = strike_details.get(s, {})
+        call_oi, put_oi = d.get("call_oi", 0), d.get("put_oi", 0)
+        customdata[i, 0, :] = [s, per_strike_gex[s], d.get("oi", 0), call_oi, put_oi]
+        t = f"${gex_values[i]:.2f}B"
+        if s == king_strike:
+            t += "\n👑 KING NODE"
+        elif s in downside_defense:
+            t += "\n↓ Downside defense"
+        elif s in upside_resistance:
+            t += "\n↑ Upside resistance"
+        elif s in gatekeeper_strikes:
+            t += "\nGatekeeper"
+        cell_texts.append([t])
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=["GEX"],
+            y=strikes,
+            text=cell_texts,
+            texttemplate="%{text}",
+            textfont=dict(size=10),
+            colorscale=gex_colorscale,
+            zmid=0,
+            zmin=-max_abs,
+            zmax=max_abs,
+            colorbar=dict(title="GEX ($B)"),
+            hoverongaps=False,
+            customdata=customdata,
+            hovertemplate="Strike: %{customdata[0]:.0f}<br>GEX: $%{z:.3f}B<br>OI: %{customdata[2]:,.0f}<br>Call OI: %{customdata[3]:,.0f} / Put OI: %{customdata[4]:,.0f}<extra></extra>",
+        )
+    )
+
+    strong_threshold = max_abs * 0.25 if max_abs > 0 else 0
+    i = 0
+    while i < len(strikes):
+        j = i
+        while j < len(strikes) and abs(gex_values[j]) >= strong_threshold:
+            j += 1
+        if j - i >= 3:
+            y_top, y_bot = strikes[i], strikes[j - 1]
+            fig.add_shape(
+                type="rect",
+                x0=-0.55, x1=0.55,
+                y0=y_top, y1=y_bot,
+                line=dict(color="rgba(255,165,0,0.8)", width=2, dash="dot"),
+                fillcolor="rgba(255,165,0,0.08)",
+                xref="x", yref="y",
+            )
+        i = j if j > i else i + 1
+
+    if king_strike is not None and king_strike in strikes:
+        pad = max(2, (max(strikes) - min(strikes)) / len(strikes) * 0.5) if strikes else 2.5
+        fig.add_shape(
+            type="rect",
+            x0=-0.52, x1=0.52,
+            y0=king_strike + pad, y1=king_strike - pad,
+            line=dict(color="gold", width=3),
+            fillcolor="rgba(255,215,0,0.15)",
+            xref="x", yref="y",
+        )
+
+    if gamma_flip_strike is not None:
+        fig.add_shape(
+            type="line",
+            x0=-0.5, x1=0.5,
+            y0=gamma_flip_strike, y1=gamma_flip_strike,
+            line=dict(color="limegreen", width=2, dash="dash"),
+            xref="x", yref="y",
+        )
+        fig.add_annotation(
+            x=-0.5, y=gamma_flip_strike,
+            text=f"Zero-Gamma Flip ${gamma_flip_strike:.0f}",
+            showarrow=False,
+            font=dict(color="limegreen", size=9),
+            xref="x", yref="y",
+            xanchor="right",
+        )
+
+    fig.add_shape(
+        type="line",
+        x0=-0.5, x1=0.5,
+        y0=spot_price, y1=spot_price,
+        line=dict(color="red", width=4, dash="dash"),
+        xref="x", yref="y",
+    )
+    fig.add_annotation(
+        x=-0.5, y=spot_price,
+        text=f"Current Spot ${spot_price:.1f}",
+        showarrow=False,
+        font=dict(color="red", size=11, family="Arial Black"),
+        xref="x", yref="y",
+        xanchor="right",
+    )
+
+    y_min, y_max = min(strikes), max(strikes)
+    y_pad = max(10, (y_max - y_min) * 0.03)
+    n_ticks = min(20, max(8, len(strikes) // 2))
+    tickvals = list(strikes[:: max(1, len(strikes) // n_ticks)])
+    if not tickvals:
+        tickvals = [y_min, (y_min + y_max) / 2, y_max]
+    fig.update_layout(
+        title=f"{symbol_label} — Expiring {exp_date_str}",
+        xaxis_title="GEX ($B)",
+        yaxis_title="Strike Price",
+        yaxis=dict(
+            autorange="reversed",
+            range=[y_max + y_pad, y_min - y_pad],
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=[f"{v:.0f}" for v in tickvals],
+            tickfont=dict(size=10),
+        ),
+        height=350 + len(strikes) * 10,
+        margin=dict(l=80, r=100),
+    )
+    return fig
+
+
+def get_confluence_alerts(symbol_data: Dict[str, SymbolGexData]) -> List[str]:
+    """Detect aligned King Nodes across symbols. SPX ≈ 10× SPY."""
+    alerts = []
+    spx = symbol_data.get("SPX")
+    spy = symbol_data.get("SPY")
+    qqq = symbol_data.get("QQQ")
+
+    if spx and spy and spx.king_strike and spy.king_strike:
+        spx_norm = spx.king_strike / 10
+        if abs(spx_norm - spy.king_strike) / spy.king_strike < 0.02:
+            alerts.append("🟢 **SPX/SPY King aligned → high prob zone** (index/ETF gamma confluence)")
+    if spx and qqq and spx.king_strike and qqq.king_strike:
+        spx_norm = spx.king_strike / 12  # rough SPX/QQQ ratio
+        if abs(spx_norm - qqq.king_strike) / qqq.king_strike < 0.03:
+            alerts.append("🟢 **SPX/QQQ King aligned → broad gamma support**")
+    if spy and qqq and spy.king_strike and qqq.king_strike:
+        if abs(spy.king_strike / 1.2 - qqq.king_strike) / qqq.king_strike < 0.03:
+            alerts.append("🟢 **SPY/QQQ King aligned → ETF gamma confluence**")
+    return alerts
 
 
 # --- Page config and client init (before sidebar so we have default_symbol) ---
@@ -242,12 +582,7 @@ if client is None:
 
 with st.sidebar:
     st.title("Gamma Exposure")
-    ticker = st.text_input(
-        "Ticker",
-        value=default_symbol,
-        key="ticker",
-        help=f"Default {default_symbol} for {broker_name}. Use $SPX for Schwab, $SPX.X for TDA.",
-    )
+    st.caption("SPX | SPY | QQQ side-by-side")
     strike_count = st.slider("Strike count", min_value=10, max_value=100, value=50, key="strikes")
     refresh_interval = st.slider(
         "Refresh interval (seconds)",
@@ -258,166 +593,153 @@ with st.sidebar:
         key="refresh",
     )
     strike_range = st.slider(
-        "Strike range (± from spot)",
+        "Strike window (± from spot)",
         min_value=200,
-        max_value=1500,
+        max_value=1000,
         value=800,
         step=50,
         key="strike_range",
         help="Only show strikes within ± this many points from spot",
+    )
+    gex_min_threshold = st.slider(
+        "GEX min threshold ($B)",
+        min_value=0.0,
+        max_value=10.0,
+        value=0.0,
+        step=0.5,
+        key="gex_threshold",
+        help="Hide strikes with |GEX| below this (0 = show all)",
     )
     if st.button("Refresh now"):
         st.rerun()
 
 st.caption(f"Using {broker_name} API")
 
-# --- Fetch data ---
+# --- Fetch all symbols ---
 if "previous_gex" not in st.session_state:
     st.session_state.previous_gex = {}
 
-result, err_msg = fetch_options_and_gex(
-    client, ticker, strike_count, st.session_state.previous_gex, client_module
-)
-if result is None:
-    st.error(f"Failed to fetch option chain: {err_msg}")
-    st.stop()
+symbol_data: Dict[str, SymbolGexData] = {}
+fetch_errors: List[str] = []
 
-_data, total_gex, per_strike_gex, strike_details, spot_price, exp_date = result
-st.session_state.previous_gex = per_strike_gex.copy()
+with st.spinner("Fetching SPX, SPY, QQQ..."):
+    for api_symbol, label in MULTI_SYMBOLS:
+        prev = st.session_state.previous_gex.get(api_symbol, {})
+        result, err_msg = fetch_options_and_gex(
+            client, api_symbol, strike_count, prev, client_module
+        )
+        if result is None:
+            fetch_errors.append(f"{label}: {err_msg}")
+            continue
+        st.session_state.previous_gex[api_symbol] = dict(result[2])  # per_strike_gex
+        processed = process_symbol_gex(result, strike_range, gex_min_threshold)
+        if processed is None:
+            fetch_errors.append(f"{label}: no strikes in window")
+            continue
+        processed.symbol = api_symbol
+        processed.label = label
+        symbol_data[label] = processed
+
+if not symbol_data:
+    st.error("Could not fetch any symbols. " + (" ".join(fetch_errors)))
+    st.stop()
+if fetch_errors:
+    for e in fetch_errors:
+        st.warning(e)
 
 last_update = datetime.now(pytz.timezone("US/Eastern")).strftime("%b %d, %Y %H:%M:%S ET")
-exp_date_str = exp_date.strftime("%b %d, %Y")
-st.caption(f"Options expiring **{exp_date_str}**  •  Data as of {last_update}")
+st.caption(f"Data as of {last_update}")
 
-# --- Identify King Node and Gatekeepers ---
-sorted_by_abs = sorted(
-    per_strike_gex.items(),
-    key=lambda x: abs(x[1]),
-    reverse=True,
-)
-king_strike = sorted_by_abs[0][0] if sorted_by_abs else None
+def _render_symbol_column(data: SymbolGexData):
+    """Render heatmap, inference, and interpretation for one symbol in a column."""
+    exp_date_str = data.exp_date.strftime("%b %d, %Y")
+    fig = build_heatmap_fig(data, data.label, exp_date_str)
+    st.plotly_chart(fig, use_container_width=True, key=f"heatmap_{data.label}")
 
-top_positive = [s for s, g in sorted(per_strike_gex.items(), key=lambda x: x[1], reverse=True)[:3]]
-top_negative = [s for s, g in sorted(per_strike_gex.items(), key=lambda x: x[1])[:3]]
-gatekeeper_strikes = set(top_positive + top_negative)
+    st.markdown("#### Inference")
+    dir_kn = "above" if (data.king_strike and data.spot_price > data.king_strike) else "below"
+    st.metric("Distance to King Node", f"{data.dist_to_king:.0f} pts {dir_kn}" if data.dist_to_king else "—")
+    st.metric("Gatekeeper below", f"${data.nearest_gk_below:.0f}" if data.nearest_gk_below else "—")
+    st.metric("Gatekeeper above", f"${data.nearest_gk_above:.0f}" if data.nearest_gk_above else "—")
+    if data.gamma_flip_strike:
+        st.caption(f"Zero-gamma flip: ${data.gamma_flip_strike:.0f}")
 
-# --- Build heatmap with focused strike range (spot ± strike_range) ---
-all_strikes = sorted(per_strike_gex.keys(), reverse=True)
-strikes = [s for s in all_strikes if abs(s - spot_price) <= strike_range]
-if not strikes:
-    strikes = all_strikes  # fallback if filter too tight
+    alerts = []
+    if data.king_strike:
+        dist = data.spot_price - data.king_strike
+        if dist < 0 and data.king_gex > 0:
+            alerts.append(("🟢", "Approaching strong support node"))
+        elif dist < 0 and data.king_gex < 0:
+            alerts.append(("🔴", "Approaching King Node resistance"))
+        elif dist > 0 and data.king_gex < 0:
+            alerts.append(("🔴", "Resistance overhead at King Node"))
+        elif dist > 0 and data.king_gex > 0:
+            alerts.append(("🟢", "Support below at King Node"))
+    if data.nearest_gk_below and data.per_strike_gex.get(data.nearest_gk_below, 0) > 0:
+        if (data.spot_price - data.nearest_gk_below) < data.spot_price * 0.02:
+            alerts.append(("🟢", f"Near downside defense (${data.nearest_gk_below:.0f})"))
+    if data.nearest_gk_above and data.per_strike_gex.get(data.nearest_gk_above, 0) < 0:
+        if (data.nearest_gk_above - data.spot_price) < data.spot_price * 0.02:
+            alerts.append(("🔴", f"Resistance overhead (${data.nearest_gk_above:.0f})"))
+    if data.gamma_flip_strike and abs(data.spot_price - data.gamma_flip_strike) < data.spot_price * 0.015:
+        alerts.append(("🟡", f"Near zero-gamma flip (${data.gamma_flip_strike:.0f})"))
+    for icon, msg in alerts[:3]:
+        st.markdown(f"{icon} {msg}")
+    if not alerts:
+        st.caption("No active alerts.")
 
-gex_values = [per_strike_gex[s] for s in strikes]
+    st.metric("Total GEX", f"${data.total_gex:.3f}B")
+    st.metric("Spot", f"${data.spot_price:.2f}")
+    st.metric("King Node", f"${data.king_strike:.0f}" if data.king_strike else "—")
 
-# Single column heatmap (y=strikes as floats for numeric axis + correct range)
-z = np.array([[g] for g in gex_values])
-max_abs = max(abs(g) for g in gex_values) if gex_values else 1
-
-gex_colorscale = [
-    [0.0, "#4B0082"],
-    [0.25, "#8B0000"],
-    [0.5, "#F5F5F5"],
-    [0.75, "#228B22"],
-    [1.0, "#006400"],
-]
-
-customdata = np.zeros((len(strikes), 1, 4))
-cell_texts = []
-for i, s in enumerate(strikes):
-    d = strike_details.get(s, {})
-    customdata[i, 0, :] = [s, per_strike_gex[s], d.get("oi", 0), d.get("gamma_sum", 0)]
-    g = gex_values[i]
-    t = f"${g:.2f}B"
-    if s == king_strike:
-        t += "\n👑 King Node"
-    elif s in gatekeeper_strikes:
-        t += "\nGatekeeper"
-    cell_texts.append([t])
-
-fig = go.Figure(
-    data=go.Heatmap(
-        z=z,
-        x=["GEX"],
-        y=strikes,
-        text=cell_texts,
-        texttemplate="%{text}",
-        textfont=dict(size=10),
-        colorscale=gex_colorscale,
-        zmid=0,
-        zmin=-max_abs,
-        zmax=max_abs,
-        hoverongaps=False,
-        customdata=customdata,
-        hovertemplate="Strike: %{customdata[0]:.0f}<br>GEX: $%{z:.3f}B<br>OI: %{customdata[2]:,.0f}<br>Gamma×Vol: %{customdata[3]:,.2f}<extra></extra>",
+    interp = generate_gex_interpretation(
+        data.spot_price, data.total_gex, data.king_strike,
+        data.downside_defense, data.upside_resistance, data.per_strike_gex
     )
-)
+    sugg = generate_trader_suggestions(
+        data.spot_price, data.total_gex, data.king_strike,
+        data.downside_defense, data.upside_resistance, data.per_strike_gex
+    )
+    with st.expander("Interpretation & Suggestions"):
+        st.markdown(f"<p style='line-height: 1.5; font-size: 0.9em;'>{interp.replace('$', '&#36;')}</p>", unsafe_allow_html=True)
+        st.markdown("**Suggestions**")
+        st.markdown(f"<p style='line-height: 1.5; font-size: 0.9em;'>{sugg.replace('$', '&#36;')}</p>", unsafe_allow_html=True)
 
-# Red horizontal line at spot
-fig.add_shape(
-    type="line",
-    x0=-0.5,
-    x1=0.5,
-    y0=spot_price,
-    y1=spot_price,
-    line=dict(color="red", width=2, dash="dash"),
-    xref="x",
-    yref="y",
-)
-fig.add_annotation(
-    x=-0.5,
-    y=spot_price,
-    text=f"Spot ${spot_price:.1f}",
-    showarrow=False,
-    font=dict(color="red", size=10),
-    xref="x",
-    yref="y",
-    xanchor="right",
-)
 
-# Constrain y-axis to strike range (numeric y = strikes, so range applies correctly)
-y_min, y_max = min(strikes), max(strikes)
-y_pad = max(10, (y_max - y_min) * 0.03)
-fig.update_layout(
-    title=f"Gamma Exposure by Strike — Expiring {exp_date_str}",
-    xaxis_title="",
-    yaxis_title="Strike Price",
-    yaxis=dict(
-        autorange="reversed",
-        range=[y_max + y_pad, y_min - y_pad],
-        dtick=50,
-    ),
-    height=400 + len(strikes) * 14,
-    margin=dict(l=100, r=140),
-)
+# --- King Node comparison and confluence (top) ---
+st.markdown("### King Node Comparison")
+rows = []
+for label in ["SPX", "SPY", "QQQ"]:
+    d = symbol_data.get(label)
+    if d:
+        rows.append({
+            "Symbol": label,
+            "Spot": f"${d.spot_price:.1f}",
+            "King Node": f"${d.king_strike:.0f}" if d.king_strike else "—",
+            "King GEX ($B)": f"{d.king_gex:.2f}" if d.king_strike else "—",
+            "Total GEX ($B)": f"{d.total_gex:.2f}",
+            "Zero-Gamma Flip": f"${d.gamma_flip_strike:.0f}" if d.gamma_flip_strike else "—",
+        })
+if rows:
+    st.dataframe(rows, use_container_width=True, hide_index=True)
 
-st.plotly_chart(fig, use_container_width=True)
+confluence = get_confluence_alerts(symbol_data)
+if confluence:
+    st.markdown("### Confluence Alerts")
+    for msg in confluence:
+        st.markdown(msg)
 
-# --- Summary stats ---
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Total GEX", f"${total_gex:.3f}B")
-with col2:
-    st.metric("Spot", f"${spot_price:.2f}")
-with col3:
-    st.metric("King Node", f"${king_strike:.0f}" if king_strike else "—")
-with col4:
-    st.metric("Last update", last_update)
-
-# --- Interpretation ---
-interpretation = generate_gex_interpretation(
-    spot_price, total_gex, king_strike, top_positive, top_negative, per_strike_gex
-)
-trader_suggestions = generate_trader_suggestions(
-    spot_price, total_gex, king_strike, top_positive, top_negative, per_strike_gex
-)
+# --- Side-by-side columns: SPX | SPY | QQQ ---
 st.markdown("---")
-st.markdown("**Interpretation**")
-# Escape $ to avoid Streamlit's LaTeX math mode; render as HTML for proper paragraph formatting
-safe_text = interpretation.replace("$", "&#36;")
-st.markdown(f"<p style='line-height: 1.6;'>{safe_text}</p>", unsafe_allow_html=True)
-st.markdown("**Trading Suggestions**")
-safe_suggestions = trader_suggestions.replace("$", "&#36;")
-st.markdown(f"<p style='line-height: 1.6;'>{safe_suggestions}</p>", unsafe_allow_html=True)
+st.markdown("### SPX | SPY | QQQ")
+cols = st.columns(3)
+for j, label in enumerate(["SPX", "SPY", "QQQ"]):
+    with cols[j]:
+        st.markdown(f"### {label}")
+        if label in symbol_data:
+            _render_symbol_column(symbol_data[label])
+        else:
+            st.info(f"No data for {label}. Check fetch errors above.")
 
 # --- Auto-refresh ---
 st.markdown("---")
