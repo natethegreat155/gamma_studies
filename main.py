@@ -6,6 +6,12 @@ the newer Charles Schwab API.  The active broker can be selected with the
 back to the first provider whose configuration is available on the system.
 """
 
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from the directory containing this script (works regardless of cwd)
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from datetime import datetime, timedelta
 import inspect
 import os
@@ -123,6 +129,8 @@ class GammaExposureScheduler:
             redirect_uri = getattr(self.secrets, "redirect_uri", None) or DEFAULT_REDIRECT_URI
             if redirect_uri:
                 auth_kwargs["redirect_uri"] = redirect_uri
+            if hasattr(self.secrets, "app_secret"):
+                auth_kwargs["app_secret"] = self.secrets.app_secret
             if hasattr(self.secrets, "token_encryption_key"):
                 auth_kwargs["encryption_key"] = getattr(self.secrets, "token_encryption_key")
             if hasattr(self.secrets, "cert_file"):
@@ -139,29 +147,63 @@ class GammaExposureScheduler:
                 **filtered_kwargs,
             )
         except FileNotFoundError:
-            with webdriver.Chrome() as driver:
-                login_kwargs = {
-                    "driver": driver,
-                    "api_key": self.secrets.api_key,
-                    "redirect_uri": getattr(self.secrets, "redirect_uri", None)
-                    or DEFAULT_REDIRECT_URI,
-                    "token_path": self.secrets.token_path,
-                }
+            redirect_uri = getattr(self.secrets, "redirect_uri", None) or DEFAULT_REDIRECT_URI
 
-                # Optional Schwab parameters are passed only if present.
-                for optional_attr in ("cert_file", "encryption_key", "token_encryption_key"):
-                    if hasattr(self.secrets, optional_attr):
-                        login_kwargs[optional_attr] = getattr(self.secrets, optional_attr)
-
-                # Remove keys with None values to avoid unexpected keyword errors
-                login_kwargs = {k: v for k, v in login_kwargs.items() if v is not None}
-
-                filtered_login_kwargs = self._filter_supported_kwargs(
-                    self.auth_module.client_from_login_flow,
-                    login_kwargs,
+            if hasattr(self.auth_module, "client_from_login_flow"):
+                # TDA: automated login via Selenium
+                with webdriver.Chrome() as driver:
+                    login_kwargs = {
+                        "driver": driver,
+                        "api_key": self.secrets.api_key,
+                        "redirect_uri": redirect_uri,
+                        "token_path": self.secrets.token_path,
+                    }
+                    for optional_attr in ("cert_file", "encryption_key", "token_encryption_key"):
+                        if hasattr(self.secrets, optional_attr):
+                            login_kwargs[optional_attr] = getattr(self.secrets, optional_attr)
+                    login_kwargs = {k: v for k, v in login_kwargs.items() if v is not None}
+                    filtered_login_kwargs = self._filter_supported_kwargs(
+                        self.auth_module.client_from_login_flow,
+                        login_kwargs,
+                    )
+                    self.client = self.auth_module.client_from_login_flow(**filtered_login_kwargs)
+            elif hasattr(self.auth_module, "client_from_manual_flow"):
+                # Schwab: manual flow (print URL, user pastes redirect back)
+                if (self.secrets.api_key == "YOUR_SCHWAB_CLIENT_ID@AMER.OAUTHAP"
+                        or self.secrets.app_secret == "YOUR_APP_SECRET_HERE"):
+                    raise BrokerConfigurationError(
+                        "Credentials not loaded. Ensure .env exists with SCHWAB_API_KEY and "
+                        "SCHWAB_APP_SECRET, or that those environment variables are set."
+                    )
+                print(f"Callback URL: {redirect_uri}")
+                print("  (Must EXACTLY match a URL in your Schwab app's Callback URL list)")
+                # Sanitize pasted URLs: browsers often wrap long URLs with newlines when copying
+                _orig_prompt = getattr(self.auth_module, "prompt", None)
+                if _orig_prompt is not None:
+                    def _sanitized_prompt(*args, **kwargs):
+                        result = _orig_prompt(*args, **kwargs)
+                        return result.replace("\n", "").replace("\r", "").strip()
+                    self.auth_module.prompt = _sanitized_prompt
+                try:
+                    manual_kwargs = {
+                        "api_key": self.secrets.api_key,
+                        "app_secret": self.secrets.app_secret,
+                        "callback_url": redirect_uri,
+                        "token_path": self.secrets.token_path,
+                    }
+                    filtered_manual_kwargs = self._filter_supported_kwargs(
+                        self.auth_module.client_from_manual_flow,
+                        manual_kwargs,
+                    )
+                    self.client = self.auth_module.client_from_manual_flow(**filtered_manual_kwargs)
+                finally:
+                    if _orig_prompt is not None:
+                        self.auth_module.prompt = _orig_prompt
+            else:
+                raise BrokerConfigurationError(
+                    f"No token file at {self.secrets.token_path} and no login flow "
+                    "available for this broker."
                 )
-
-                self.client = self.auth_module.client_from_login_flow(**filtered_login_kwargs)
 
     def fetch_and_update_gamma_exposure(self):
         eastern = pytz.timezone('US/Eastern')
@@ -203,7 +245,13 @@ class GammaExposureScheduler:
                     self.plotter.show_plots()
                     pause_duration = 5
                 else:
-                    print(f"Failed to fetch data: {r.status_code}")
+                    body = r.text
+                    try:
+                        err = r.json()
+                        body = err.get("message", err.get("error", body))
+                    except Exception:
+                        pass
+                    print(f"Failed to fetch data: {r.status_code} – {body}")
                     pause_duration = 5  # Longer pause when fetch fails
         except Exception as e:
             print(f"An error occurred: {e}")
@@ -241,5 +289,6 @@ class GammaExposureScheduler:
 
             time_module.sleep(4)  # Sleep until time to run API request again
 
-scheduler = GammaExposureScheduler()
-scheduler.run()
+if __name__ == "__main__":
+    scheduler = GammaExposureScheduler()
+    scheduler.run()

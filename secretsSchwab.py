@@ -25,9 +25,12 @@ def _optional_env(var_name: str) -> str | None:
     return None
 
 
-# OAuth client identifier provided by the Schwab developer portal.  Schwab
-# uses the ``{client_id}@AMER.OAUTHAP`` format for live applications.
+# App Key from the Schwab developer portal (developer.schwab.com).  For
+# production apps this includes ``@AMER.OAUTHAP``.
 api_key = os.environ.get("SCHWAB_API_KEY", "YOUR_SCHWAB_CLIENT_ID@AMER.OAUTHAP")
+
+# Secret from the Schwab developer portal (same page as App Key).
+app_secret = os.environ.get("SCHWAB_APP_SECRET", "YOUR_APP_SECRET_HERE")
 
 # Location on disk where the Schwab token JSON file should be stored.  This is
 # created automatically during the first authentication flow.
@@ -46,14 +49,16 @@ cert_file = _optional_env("SCHWAB_CERT_FILE")
 # Optional symmetric key used by ``schwab-py`` to encrypt refresh tokens.
 token_encryption_key = _optional_env("SCHWAB_TOKEN_ENCRYPTION_KEY")
 
-# Application specific defaults for plotting.
-option_symbol = os.environ.get("SCHWAB_OPTION_SYMBOL", "$SPX.X")
+# Application specific defaults for plotting. Use $SPX for Schwab API
+# ($SPX.X is a legacy TDA format that Schwab no longer accepts).
+option_symbol = os.environ.get("SCHWAB_OPTION_SYMBOL", "$SPX")
 strike_count = int(os.environ.get("SCHWAB_STRIKE_COUNT", "50"))
 
 
 __all__ = [
     "api_key",
     "token_path",
+    "app_secret",
     "redirect_uri",
     "cert_file",
     "token_encryption_key",

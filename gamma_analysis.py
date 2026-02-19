@@ -87,3 +87,48 @@ def calculate_gamma_exposure(
         largest_changes,
         spot_price,
     )
+
+
+def get_per_strike_details(data: Dict) -> Dict[float, Dict]:
+    """Extract per-strike OI, gamma contribution, and volume for tooltips.
+
+    Returns a dict mapping strike -> {oi, gamma_sum, volume, call_oi, put_oi}.
+    """
+    details: Dict[float, Dict] = {}
+
+    def add(strike: str, option_type: str, gamma: float, volume: float, oi: float) -> None:
+        try:
+            k = float(strike)
+            if k not in details:
+                details[k] = {
+                    "oi": 0,
+                    "gamma_sum": 0.0,
+                    "volume": 0,
+                    "call_oi": 0,
+                    "put_oi": 0,
+                }
+            details[k]["oi"] += oi
+            details[k]["volume"] += volume
+            details[k]["gamma_sum"] += gamma * volume
+            if option_type == "call":
+                details[k]["call_oi"] += oi
+            else:
+                details[k]["put_oi"] += oi
+        except (ValueError, TypeError):
+            pass
+
+    for _, strikes in data.get("callExpDateMap", {}).items():
+        for strike, options in strikes.items():
+            for opt in options:
+                vol = opt.get("totalVolume", 0) or 0
+                oi = opt.get("openInterest", vol) or vol
+                add(strike, "call", opt.get("gamma", 0) or 0, vol, oi)
+
+    for _, strikes in data.get("putExpDateMap", {}).items():
+        for strike, options in strikes.items():
+            for opt in options:
+                vol = opt.get("totalVolume", 0) or 0
+                oi = opt.get("openInterest", vol) or vol
+                add(strike, "put", opt.get("gamma", 0) or 0, vol, oi)
+
+    return details
