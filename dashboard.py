@@ -806,14 +806,6 @@ def _render_symbol_column(data: SymbolGexData):
     fig = build_heatmap_fig(data, data.label, exp_date_str)
     st.plotly_chart(fig, use_container_width=True, key=f"heatmap_{data.label}")
 
-    with st.expander("Legend", expanded=True):
-        st.markdown("""
-        - **Orange dotted box:** Strong gamma cluster — 3+ consecutive strikes with GEX ≥ 25% of max. Dealers concentrate hedging here.
-        - **King Node:** Strike with largest absolute GEX; dominant level for support (positive) or resistance (negative).
-        - **Gatekeeper:** Key gamma strike (support below spot or resistance above) that can act as a magnet or wall.
-        - **Zero-gamma flip:** Level where cumulative gamma flips sign; breaks above/below can accelerate dealer hedging.
-        """)
-
     st.markdown("#### Inference")
     dir_kn = "above" if (data.king_strike and data.spot_price > data.king_strike) else "below"
     st.metric("Distance to King Node", f"{data.dist_to_king:.0f} pts {dir_kn}" if data.dist_to_king else "—")
@@ -858,7 +850,7 @@ def _render_symbol_column(data: SymbolGexData):
         data.spot_price, data.total_gex, data.king_strike,
         data.downside_defense, data.upside_resistance, data.per_strike_gex
     )
-    with st.expander("Interpretation & Suggestions"):
+    with st.expander("Interpretation & Suggestions", expanded=False):
         st.markdown(f"<p style='line-height: 1.5; font-size: 0.9em;'>{interp.replace('$', '&#36;')}</p>", unsafe_allow_html=True)
         st.markdown("**Suggestions**")
         st.markdown(f"<p style='line-height: 1.5; font-size: 0.9em;'>{sugg.replace('$', '&#36;')}</p>", unsafe_allow_html=True)
@@ -899,6 +891,14 @@ for j, label in enumerate(["SPX", "SPY", "QQQ"]):
         else:
             st.info(f"No data for {label}. Check fetch errors above.")
 
+with st.expander("Legend", expanded=True):
+    st.markdown("""
+    - **Orange dotted box:** Strong gamma cluster — 3+ consecutive strikes with GEX ≥ 25% of max. Dealers concentrate hedging here.
+    - **King Node:** Strike with largest absolute GEX; dominant level for support (positive) or resistance (negative).
+    - **Gatekeeper:** Key gamma strike (support below spot or resistance above) that can act as a magnet or wall.
+    - **Zero-gamma flip:** Level where cumulative gamma flips sign; breaks above/below can accelerate dealer hedging.
+    """)
+
 # --- Combined interpretation (all 3 charts together) ---
 st.markdown("---")
 st.markdown("### Combined Interpretation (SPX, SPY, QQQ)")
@@ -933,12 +933,10 @@ if llm_text:
         unsafe_allow_html=True,
     )
 else:
-    combined = generate_combined_interpretation(symbol_data, confluence)
     if not os.environ.get("GEMINI_API_KEY"):
-        st.caption("Set GEMINI_API_KEY in .env for AI-powered interpretation; showing generic view.")
+        st.caption("Set GEMINI_API_KEY in .env for AI-powered interpretation.")
     else:
         st.caption("Click **Generate** above for AI interpretation.")
-    st.markdown(f"<p style='line-height: 1.6; font-size: 0.95em;'>{combined.replace('$', '&#36;')}</p>", unsafe_allow_html=True)
 
 # --- Auto-refresh ---
 st.markdown("---")
