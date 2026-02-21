@@ -12,6 +12,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+import json
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -480,17 +481,6 @@ def build_heatmap_fig(
             )
         i = j if j > i else i + 1
 
-    if king_strike is not None and king_strike in strikes:
-        pad = max(2, (max(strikes) - min(strikes)) / len(strikes) * 0.5) if strikes else 2.5
-        fig.add_shape(
-            type="rect",
-            x0=-0.52, x1=0.52,
-            y0=king_strike + pad, y1=king_strike - pad,
-            line=dict(color="gold", width=3),
-            fillcolor="rgba(255,215,0,0.15)",
-            xref="x", yref="y",
-        )
-
     if gamma_flip_strike is not None:
         fig.add_shape(
             type="line",
@@ -548,6 +538,68 @@ def build_heatmap_fig(
     return fig
 
 
+def generate_combined_interpretation(
+    symbol_data: Dict[str, SymbolGexData],
+    confluence_alerts: List[str],
+) -> str:
+    """Generate a cross-symbol interpretation synthesizing SPX, SPY, QQQ together.
+    SPX, SPY, and QQQ are highly correlated (index/ETF proxies for broad market and tech)."""
+    spx = symbol_data.get("SPX")
+    spy = symbol_data.get("SPY")
+    qqq = symbol_data.get("QQQ")
+    available = [d for d in [spx, spy, qqq] if d is not None]
+    if len(available) < 2:
+        return (
+            "SPX, SPY, and QQQ are highly correlated; viewing multiple allows cross-checking gamma signals "
+            "and identifying regime confluence. Add more symbols for full combined interpretation."
+        )
+
+    sentences = []
+
+    # Correlation context
+    sentences.append(
+        "**SPX, SPY, and QQQ are highly correlated**—SPX is the index, SPY tracks it (~1/10 scale), "
+        "and QQQ leans tech-heavy. When gamma regimes align across all three, the signal is more robust; "
+        "divergences can indicate sector-specific positioning."
+    )
+
+    # Regime alignment or divergence
+    signs = [(d.label, 1 if d.total_gex > 0 else -1 if d.total_gex < 0 else 0) for d in available]
+    gex_strs = [f"{d.label} ${d.total_gex:.2f}B" for d in available]
+    all_pos = all(s[1] == 1 for s in signs)
+    all_neg = all(s[1] == -1 for s in signs)
+    if all_pos:
+        sentences.append(
+            f"All show **positive GEX** ({', '.join(gex_strs)})—"
+            "dealer long gamma across the board; expect mean reversion and dampened volatility in both broad market and tech."
+        )
+    elif all_neg:
+        sentences.append(
+            f"All show **negative GEX** ({', '.join(gex_strs)})—"
+            "dealers short gamma; momentum can extend in either direction."
+        )
+    else:
+        regime_parts = [f"{s[0]} ({'long' if s[1] == 1 else 'short'} gamma)" for s in signs]
+        sentences.append(
+            f"**Mixed regimes** across symbols: {', '.join(regime_parts)}. "
+            "Index and ETF gamma can diverge when institutional flows concentrate in one product; "
+            "use the dominant regime (often SPX or SPY by volume) for broad market bias."
+        )
+
+    # Confluence summary
+    if confluence_alerts:
+        sentences.append(
+            "**Confluence:** Aligned King Nodes across these correlated underlyings reinforce support/resistance."
+        )
+    else:
+        sentences.append(
+            "No strong King Node confluence across symbols; each has distinct gamma focal points. "
+            "Check individual interpretations for per-symbol levels."
+        )
+
+    return " ".join(sentences)
+
+
 def get_confluence_alerts(symbol_data: Dict[str, SymbolGexData]) -> List[str]:
     """Detect aligned King Nodes across symbols. SPX ≈ 10× SPY."""
     alerts = []
@@ -569,6 +621,102 @@ def get_confluence_alerts(symbol_data: Dict[str, SymbolGexData]) -> List[str]:
     return alerts
 
 
+def _build_gex_payload(symbol_data: Dict[str, SymbolGexData]) -> str:
+    """Build a structured JSON payload of gamma data for all symbols, for LLM consumption."""
+    payload = {}
+    for label in ["SPX", "SPY", "QQQ"]:
+        d = symbol_data.get(label)
+        if d is None:
+            continue
+        p = {
+            "spot_price": d.spot_price,
+            "total_gex_B": round(d.total_gex, 2),
+            "king_node": {"strike": d.king_strike, "gex_B": round(d.king_gex, 2)} if d.king_strike else None,
+            "downside_defense": [
+                {"strike": s, "gex_B": round(d.per_strike_gex.get(s, 0), 2)} for s in d.downside_defense[:3]
+            ] if d.downside_defense else [],
+            "upside_resistance": [
+                {"strike": s, "gex_B": round(d.per_strike_gex.get(s, 0), 2)} for s in d.upside_resistance[:3]
+            ] if d.upside_resistance else [],
+            "nearest_support_below": d.nearest_gk_below,
+            "nearest_resistance_above": d.nearest_gk_above,
+            "gamma_flip_strike": d.gamma_flip_strike,
+            "exp_date": str(d.exp_date),
+        }
+        payload[label] = p
+    return json.dumps(payload, indent=2)
+
+
+def generate_llm_interpretation(
+    symbol_data: Dict[str, SymbolGexData],
+    confluence_alerts: List[str],
+) -> Optional[str]:
+    """Call Gemini with actual gamma data to produce actionable buy/sell guidance.
+    Returns None if API key missing or call fails (caller should fallback to generic interpretation)."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key or api_key.strip() == "":
+        return None
+
+    payload = _build_gex_payload(symbol_data)
+    today = datetime.now(pytz.timezone("US/Eastern")).strftime("%A, %B %d, %Y")
+
+    prompt = f"""You are an options market maker and gamma exposure expert. You are advising a trader for TODAY ({today}) based on the following gamma exposure (GEX) data for SPX, SPY, and QQQ. These underlyings are highly correlated: SPX is the S&P 500 index, SPY tracks it at ~1/10 scale, QQQ is tech-heavy.
+
+GEX DATA (JSON):
+```
+{payload}
+```
+
+CONFLUENCE ALERTS (if any): {confluence_alerts if confluence_alerts else "None"}
+
+DEFINITIONS:
+- **Spot** = current price
+- **King Node** = strike with largest |GEX|; positive GEX = support (dealers buy as spot falls), negative = resistance (dealers sell as spot rises)
+- **Downside defense** = support levels (positive GEX below spot)
+- **Upside resistance** = resistance levels (negative GEX above spot)
+- **Total GEX** > 0: dealers long gamma → mean reversion, dampened moves
+- **Total GEX** < 0: dealers short gamma → momentum can extend
+- **Gamma flip strike** = level where cumulative gamma flips sign
+
+TASK: Write a concise, actionable interpretation (3–5 short paragraphs) that guides the user on **how to think about buying and selling** at the current spot prices today. Be specific:
+1. For each symbol with data: Is spot near support or resistance? Should they lean long, short, or neutral?
+2. What concrete levels should they watch for entries, stops, and targets?
+3. What does confluence across SPX/SPY/QQQ imply for conviction?
+4. Any caveats (e.g., near expiry, mixed signals)?
+
+Use plain language. Reference actual numbers (strikes, distances). Do not hedge with disclaimers; give clear directional bias where the data supports it."""
+
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=api_key)
+        config = types.GenerateContentConfig(
+            system_instruction="You are a gamma exposure expert giving actionable trading guidance.",
+            max_output_tokens=4096,
+            temperature=0.4,
+            safety_settings=[
+                types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_ONLY_HIGH"),
+                types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
+                types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
+                types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"),
+            ],
+        )
+        # Use streaming to avoid truncation issues with the non-streaming API
+        chunks = []
+        for chunk in client.models.generate_content_stream(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=config,
+        ):
+            if chunk.text:
+                chunks.append(chunk.text)
+        content = "".join(chunks).strip() if chunks else None
+        return content if content else None
+    except Exception:
+        # Silently fall back to generic interpretation; caller will handle
+        return None
+
+
 # --- Page config and client init (before sidebar so we have default_symbol) ---
 st.set_page_config(
     page_title="Gamma Exposure Dashboard",
@@ -583,6 +731,8 @@ if client is None:
 with st.sidebar:
     st.title("Gamma Exposure")
     st.caption("SPX | SPY | QQQ side-by-side")
+    if not os.environ.get("GEMINI_API_KEY"):
+        st.caption("💡 Set GEMINI_API_KEY in .env for AI interpretation")
     strike_count = st.slider("Strike count", min_value=10, max_value=100, value=50, key="strikes")
     refresh_interval = st.slider(
         "Refresh interval (seconds)",
@@ -655,6 +805,14 @@ def _render_symbol_column(data: SymbolGexData):
     exp_date_str = data.exp_date.strftime("%b %d, %Y")
     fig = build_heatmap_fig(data, data.label, exp_date_str)
     st.plotly_chart(fig, use_container_width=True, key=f"heatmap_{data.label}")
+
+    with st.expander("Legend", expanded=True):
+        st.markdown("""
+        - **Orange dotted box:** Strong gamma cluster — 3+ consecutive strikes with GEX ≥ 25% of max. Dealers concentrate hedging here.
+        - **King Node:** Strike with largest absolute GEX; dominant level for support (positive) or resistance (negative).
+        - **Gatekeeper:** Key gamma strike (support below spot or resistance above) that can act as a magnet or wall.
+        - **Zero-gamma flip:** Level where cumulative gamma flips sign; breaks above/below can accelerate dealer hedging.
+        """)
 
     st.markdown("#### Inference")
     dir_kn = "above" if (data.king_strike and data.spot_price > data.king_strike) else "below"
@@ -740,6 +898,47 @@ for j, label in enumerate(["SPX", "SPY", "QQQ"]):
             _render_symbol_column(symbol_data[label])
         else:
             st.info(f"No data for {label}. Check fetch errors above.")
+
+# --- Combined interpretation (all 3 charts together) ---
+st.markdown("---")
+st.markdown("### Combined Interpretation (SPX, SPY, QQQ)")
+
+# Initialize session state for cached LLM output
+if "llm_interpretation" not in st.session_state:
+    st.session_state.llm_interpretation = None
+
+# Generate button: LLM only runs when user clicks
+if os.environ.get("GEMINI_API_KEY"):
+    if st.button("Generate", key="gen_interpretation"):
+        with st.spinner("Generating AI interpretation..."):
+            st.session_state.llm_interpretation = generate_llm_interpretation(symbol_data, confluence)
+    llm_text = st.session_state.llm_interpretation
+else:
+    llm_text = None
+
+if llm_text:
+    # Escape for safe HTML display: $ (LaTeX), < > & (HTML entities)
+    def _escape_for_display(s: str) -> str:
+        return (
+            s.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("$", "&#36;")
+        )
+    escaped = _escape_for_display(llm_text)
+    st.markdown(
+        "<div style='line-height: 1.6; font-size: 0.95em; white-space: pre-wrap; overflow-y: auto; max-height: 70vh;'>"
+        + escaped
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+else:
+    combined = generate_combined_interpretation(symbol_data, confluence)
+    if not os.environ.get("GEMINI_API_KEY"):
+        st.caption("Set GEMINI_API_KEY in .env for AI-powered interpretation; showing generic view.")
+    else:
+        st.caption("Click **Generate** above for AI interpretation.")
+    st.markdown(f"<p style='line-height: 1.6; font-size: 0.95em;'>{combined.replace('$', '&#36;')}</p>", unsafe_allow_html=True)
 
 # --- Auto-refresh ---
 st.markdown("---")
