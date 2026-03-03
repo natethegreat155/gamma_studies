@@ -177,6 +177,7 @@ class GammaExposureScheduler:
                     )
                 print(f"Callback URL: {redirect_uri}")
                 print("  (Must EXACTLY match a URL in your Schwab app's Callback URL list)")
+                print("  IMPORTANT: After logging in, copy the redirect URL immediately and paste within ~30 seconds (the code expires quickly).")
                 # Sanitize pasted URLs: browsers often wrap long URLs with newlines when copying
                 _orig_prompt = getattr(self.auth_module, "prompt", None)
                 if _orig_prompt is not None:
@@ -195,7 +196,17 @@ class GammaExposureScheduler:
                         self.auth_module.client_from_manual_flow,
                         manual_kwargs,
                     )
-                    self.client = self.auth_module.client_from_manual_flow(**filtered_manual_kwargs)
+                    _max_retries = 3
+                    for _attempt in range(_max_retries):
+                        try:
+                            self.client = self.auth_module.client_from_manual_flow(**filtered_manual_kwargs)
+                            break
+                        except Exception as oauth_exc:
+                            _msg = str(oauth_exc).lower()
+                            if ("expired" in _msg or "authorizationcode" in _msg) and _attempt < _max_retries - 1:
+                                print("\nAuthorization code expired. Visit the URL again and paste the NEW callback URL within 30 seconds.\n")
+                                continue
+                            raise
                 finally:
                     if _orig_prompt is not None:
                         self.auth_module.prompt = _orig_prompt

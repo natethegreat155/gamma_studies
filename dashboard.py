@@ -15,13 +15,33 @@ from datetime import date, datetime, timedelta
 import json
 from typing import Dict, List, Optional, Tuple
 
+import csv
+import urllib.request
+
 import numpy as np
 import pytz
 import streamlit as st
 import plotly.graph_objects as go
 
-# Symbols to fetch for multi-tab view (API symbol, display label)
-MULTI_SYMBOLS = [("$SPX", "SPX"), ("SPY", "SPY"), ("QQQ", "QQQ")]
+SP500_CSV_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+
+
+@st.cache_data(ttl=86400)
+def get_sp500_symbols() -> List[str]:
+    """Fetch S&P 500 constituent symbols. Returns sorted list of tickers."""
+    try:
+        with urllib.request.urlopen(SP500_CSV_URL) as resp:
+            reader = csv.DictReader(resp.read().decode().splitlines())
+            symbols = [row["Symbol"] for row in reader if row.get("Symbol")]
+        return sorted(set(symbols))
+    except Exception:
+        return []
+
+
+def display_to_api_symbol(label: str) -> str:
+    """Map display label to API symbol (Schwab uses $SPX for the index)."""
+    return "$SPX" if label == "SPX" else label
+
 
 from main import (
     _load_broker_client,
@@ -407,8 +427,11 @@ def build_heatmap_fig(
     data: SymbolGexData,
     symbol_label: str,
     exp_date_str: str,
+    height: int = 550,
+    y_domain_max: float = 50.0,
 ) -> go.Figure:
-    """Build a Plotly heatmap figure for given SymbolGexData."""
+    """Build a Plotly heatmap figure for given SymbolGexData.
+    y_domain_max normalizes the y-axis so SPX, SPY, QQQ render at the same visual size."""
     strikes = data.strikes
     per_strike_gex = data.per_strike_gex
     strike_details = data.strike_details
@@ -421,6 +444,11 @@ def build_heatmap_fig(
 
     gex_values = [per_strike_gex[s] for s in strikes]
     max_abs = max(abs(g) for g in gex_values) if gex_values else 1
+
+    # Normalize y to [0, y_domain_max] so all heatmaps have same visual scale (SPX/SPY/QQQ)
+    n = len(strikes)
+    y_positions = np.linspace(y_domain_max, 0, n) if n > 1 else np.array([y_domain_max / 2])
+    strike_to_y = {s: y_positions[i] for i, s in enumerate(strikes)}
 
     z = np.array([[g] for g in gex_values])
     gex_colorscale = [
@@ -448,7 +476,7 @@ def build_heatmap_fig(
         data=go.Heatmap(
             z=z,
             x=["GEX"],
-            y=strikes,
+            y=y_positions,
             text=cell_texts,
             texttemplate="%{text}",
             textfont=dict(size=10),
@@ -456,7 +484,7 @@ def build_heatmap_fig(
             zmid=0,
             zmin=-max_abs,
             zmax=max_abs,
-            colorbar=dict(title="GEX ($B)"),
+            showscale=False,
             hoverongaps=False,
             customdata=customdata,
             hovertemplate="Strike: %{customdata[0]:.0f}<br>GEX: $%{z:.3f}B<br>OI: %{customdata[2]:,.0f}<br>Call OI: %{customdata[3]:,.0f} / Put OI: %{customdata[4]:,.0f}<extra></extra>",
@@ -470,7 +498,7 @@ def build_heatmap_fig(
         while j < len(strikes) and abs(gex_values[j]) >= strong_threshold:
             j += 1
         if j - i >= 3:
-            y_top, y_bot = strikes[i], strikes[j - 1]
+            y_top, y_bot = y_positions[i], y_positions[j - 1]
             fig.add_shape(
                 type="rect",
                 x0=-0.55, x1=0.55,
@@ -482,15 +510,19 @@ def build_heatmap_fig(
         i = j if j > i else i + 1
 
     if gamma_flip_strike is not None:
+        _y_gf = strike_to_y.get(gamma_flip_strike)
+        if _y_gf is None:
+            _idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - gamma_flip_strike))
+            _y_gf = y_positions[_idx]
         fig.add_shape(
             type="line",
             x0=-0.5, x1=0.5,
-            y0=gamma_flip_strike, y1=gamma_flip_strike,
+            y0=_y_gf, y1=_y_gf,
             line=dict(color="limegreen", width=2, dash="dash"),
             xref="x", yref="y",
         )
         fig.add_annotation(
-            x=-0.5, y=gamma_flip_strike,
+            x=-0.5, y=_y_gf,
             text=f"Zero-Gamma Flip ${gamma_flip_strike:.0f}",
             showarrow=False,
             font=dict(color="limegreen", size=9),
@@ -498,15 +530,19 @@ def build_heatmap_fig(
             xanchor="right",
         )
 
+    _y_spot = strike_to_y.get(spot_price)
+    if _y_spot is None:
+        _idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot_price))
+        _y_spot = y_positions[_idx]
     fig.add_shape(
         type="line",
         x0=-0.5, x1=0.5,
-        y0=spot_price, y1=spot_price,
+        y0=_y_spot, y1=_y_spot,
         line=dict(color="red", width=4, dash="dash"),
         xref="x", yref="y",
     )
     fig.add_annotation(
-        x=-0.5, y=spot_price,
+        x=-0.5, y=_y_spot,
         text=f"Current Spot ${spot_price:.1f}",
         showarrow=False,
         font=dict(color="red", size=11, family="Arial Black"),
@@ -514,25 +550,29 @@ def build_heatmap_fig(
         xanchor="right",
     )
 
-    y_min, y_max = min(strikes), max(strikes)
-    y_pad = max(10, (y_max - y_min) * 0.03)
-    n_ticks = min(20, max(8, len(strikes) // 2))
-    tickvals = list(strikes[:: max(1, len(strikes) // n_ticks)])
-    if not tickvals:
-        tickvals = [y_min, (y_min + y_max) / 2, y_max]
+    max_ticks = 35
+    if n <= max_ticks:
+        tickvals = list(y_positions)
+        ticktext = [f"{s:.0f}" for s in strikes]
+    else:
+        step = max(1, (n - 1) // (max_ticks - 1))
+        tick_indices = list(range(0, n, step))
+        if tick_indices[-1] != n - 1:
+            tick_indices.append(n - 1)
+        tickvals = [y_positions[i] for i in tick_indices]
+        ticktext = [f"{strikes[i]:.0f}" for i in tick_indices]
     fig.update_layout(
         title=f"{symbol_label} — Expiring {exp_date_str}",
         xaxis_title="GEX ($B)",
         yaxis_title="Strike Price",
         yaxis=dict(
-            autorange="reversed",
-            range=[y_max + y_pad, y_min - y_pad],
+            range=[y_domain_max + 2, -2],
             tickmode="array",
             tickvals=tickvals,
-            ticktext=[f"{v:.0f}" for v in tickvals],
+            ticktext=ticktext,
             tickfont=dict(size=10),
         ),
-        height=350 + len(strikes) * 10,
+        height=height,
         margin=dict(l=80, r=100),
     )
     return fig
@@ -755,11 +795,23 @@ with st.sidebar:
         "GEX min threshold ($B)",
         min_value=0.0,
         max_value=10.0,
-        value=0.0,
-        step=0.5,
+        value=0.3,
+        step=0.1,
         key="gex_threshold",
         help="Hide strikes with |GEX| below this (0 = show all)",
     )
+    all_symbol_options = ["SPX", "SPY", "QQQ"] + get_sp500_symbols()
+    selected_symbols = st.multiselect(
+        "Symbols to display",
+        options=all_symbol_options,
+        default=["SPX", "SPY", "QQQ"],
+        key="symbol_selector",
+    )
+    if len(selected_symbols) > 6:
+        st.caption("Showing first 6 symbols (max to avoid slow fetches).")
+        selected_symbols = selected_symbols[:6]
+    if not selected_symbols:
+        selected_symbols = ["SPX", "SPY", "QQQ"]
     if st.button("Refresh now"):
         st.rerun()
 
@@ -772,8 +824,10 @@ if "previous_gex" not in st.session_state:
 symbol_data: Dict[str, SymbolGexData] = {}
 fetch_errors: List[str] = []
 
-with st.spinner("Fetching SPX, SPY, QQQ..."):
-    for api_symbol, label in MULTI_SYMBOLS:
+fetch_pairs = [(display_to_api_symbol(label), label) for label in selected_symbols]
+
+with st.spinner(f"Fetching {', '.join(selected_symbols)}..."):
+    for api_symbol, label in fetch_pairs:
         prev = st.session_state.previous_gex.get(api_symbol, {})
         result, err_msg = fetch_options_and_gex(
             client, api_symbol, strike_count, prev, client_module
@@ -791,7 +845,22 @@ with st.spinner("Fetching SPX, SPY, QQQ..."):
         symbol_data[label] = processed
 
 if not symbol_data:
-    st.error("Could not fetch any symbols. " + (" ".join(fetch_errors)))
+    all_refresh_errors = all("refresh_token" in (e or "").lower() for e in fetch_errors)
+    if all_refresh_errors and fetch_errors:
+        _tp = str(Path.home() / "schwab_token.json")
+        try:
+            import secretsSchwab
+            _tp = str(getattr(secretsSchwab, "token_path", _tp))
+        except Exception:
+            pass
+        st.error(
+            "**Refresh token expired.** Schwab refresh tokens expire after ~7 days of inactivity. "
+            f"Delete your token file and restart to re-authenticate:\n\n"
+            f"`rm {_tp}`\n\n"
+            "Then restart the app; you'll be prompted to complete the OAuth flow."
+        )
+    else:
+        st.error("Could not fetch any symbols. " + (" ".join(fetch_errors)))
     st.stop()
 if fetch_errors:
     for e in fetch_errors:
@@ -799,6 +868,8 @@ if fetch_errors:
 
 last_update = datetime.now(pytz.timezone("US/Eastern")).strftime("%b %d, %Y %H:%M:%S ET")
 st.caption(f"Data as of {last_update}")
+
+selected_data = {k: v for k, v in symbol_data.items() if k in selected_symbols}
 
 def _render_symbol_column(data: SymbolGexData):
     """Render heatmap, inference, and interpretation for one symbol in a column."""
@@ -859,7 +930,7 @@ def _render_symbol_column(data: SymbolGexData):
 # --- King Node comparison and confluence (top) ---
 st.markdown("### King Node Comparison")
 rows = []
-for label in ["SPX", "SPY", "QQQ"]:
+for label in selected_symbols:
     d = symbol_data.get(label)
     if d:
         rows.append({
@@ -873,7 +944,7 @@ for label in ["SPX", "SPY", "QQQ"]:
 if rows:
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
-confluence = get_confluence_alerts(symbol_data)
+confluence = get_confluence_alerts(selected_data)
 if confluence:
     st.markdown("### Confluence Alerts")
     for msg in confluence:
@@ -881,9 +952,10 @@ if confluence:
 
 # --- Side-by-side columns: SPX | SPY | QQQ ---
 st.markdown("---")
-st.markdown("### SPX | SPY | QQQ")
-cols = st.columns(3)
-for j, label in enumerate(["SPX", "SPY", "QQQ"]):
+st.markdown("### " + " | ".join(selected_symbols))
+num_cols = len(selected_symbols)
+cols = st.columns(num_cols) if num_cols > 0 else []
+for j, label in enumerate(selected_symbols):
     with cols[j]:
         st.markdown(f"### {label}")
         if label in symbol_data:
@@ -899,9 +971,9 @@ with st.expander("Legend", expanded=True):
     - **Zero-gamma flip:** Level where cumulative gamma flips sign; breaks above/below can accelerate dealer hedging.
     """)
 
-# --- Combined interpretation (all 3 charts together) ---
+# --- Combined interpretation (selected charts) ---
 st.markdown("---")
-st.markdown("### Combined Interpretation (SPX, SPY, QQQ)")
+st.markdown("### Combined Interpretation (" + ", ".join(selected_symbols) + ")")
 
 # Initialize session state for cached LLM output
 if "llm_interpretation" not in st.session_state:
@@ -911,7 +983,7 @@ if "llm_interpretation" not in st.session_state:
 if os.environ.get("GEMINI_API_KEY"):
     if st.button("Generate", key="gen_interpretation"):
         with st.spinner("Generating AI interpretation..."):
-            st.session_state.llm_interpretation = generate_llm_interpretation(symbol_data, confluence)
+            st.session_state.llm_interpretation = generate_llm_interpretation(selected_data, confluence)
     llm_text = st.session_state.llm_interpretation
 else:
     llm_text = None
