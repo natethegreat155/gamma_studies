@@ -846,7 +846,8 @@ with st.spinner(f"Fetching {', '.join(selected_symbols)}..."):
 
 if not symbol_data:
     all_refresh_errors = all("refresh_token" in (e or "").lower() for e in fetch_errors)
-    if all_refresh_errors and fetch_errors:
+    all_401_errors = all("401" in (e or "") for e in fetch_errors)
+    if (all_refresh_errors or all_401_errors) and fetch_errors:
         _tp = str(Path.home() / "schwab_token.json")
         try:
             import secretsSchwab
@@ -854,7 +855,7 @@ if not symbol_data:
         except Exception:
             pass
         st.error(
-            "**Refresh token expired.** Schwab refresh tokens expire after ~7 days of inactivity. "
+            "**Schwab token expired (401).** Refresh tokens expire after ~7 days of inactivity. "
             f"Delete your token file and restart to re-authenticate:\n\n"
             f"`rm {_tp}`\n\n"
             "Then restart the app; you'll be prompted to complete the OAuth flow."
