@@ -122,6 +122,32 @@ class GammaExposureScheduler:
         signature = inspect.signature(function)
         return {key: value for key, value in raw_kwargs.items() if key in signature.parameters}
 
+    @staticmethod
+    def _proactive_schwab_token_refresh(client: object) -> None:
+        """Force a token refresh on startup to reset Schwab's 7-day inactivity clock.
+
+        Schwab refresh tokens expire after ~7 days of *inactivity*—meaning the refresh
+        token must be *used* at least every ~6 days. The refresh token is only used
+        when the access token (30 min) expires and an API call is made. If the user
+        opens the app while the access token is still valid, no refresh occurs and
+        the 7-day clock keeps ticking. Proactively refreshing on every launch ensures
+        the refresh token is used and the clock resets.
+        """
+        if getattr(client, "session", None) is None:
+            return
+        session = client.session
+        token = getattr(session, "token", None)
+        if token is None or not token.get("refresh_token"):
+            return
+        token_endpoint = getattr(session, "metadata", {}).get("token_endpoint")
+        if not token_endpoint:
+            return
+        # Force the access token to appear expired so ensure_active_token will refresh.
+        # The refresh uses the refresh token (resetting Schwab's 7-day inactivity clock)
+        # and update_token writes the new access token to disk.
+        token["expires_at"] = 0
+        session.ensure_active_token(token)
+
     #API auth
     def authenticate(self):
         try:
@@ -215,6 +241,20 @@ class GammaExposureScheduler:
                     f"No token file at {self.secrets.token_path} and no login flow "
                     "available for this broker."
                 )
+
+        if self.client and self.broker_name == "Schwab":
+            try:
+                self._proactive_schwab_token_refresh(self.client)
+            except Exception as exc:
+                _msg = str(exc).lower()
+                if "refresh" in _msg or "token" in _msg or "invalid_client" in _msg:
+                    raise BrokerConfigurationError(
+                        "Refresh token expired. Schwab refresh tokens expire after ~7 days of "
+                        "inactivity. Delete your token file and restart to re-authenticate:\n\n"
+                        f"  rm {self.secrets.token_path}\n\n"
+                        "Then restart the app; you'll be prompted to complete the OAuth flow."
+                    ) from exc
+                raise
 
     def fetch_and_update_gamma_exposure(self):
         eastern = pytz.timezone('US/Eastern')
